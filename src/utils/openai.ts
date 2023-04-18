@@ -1,9 +1,10 @@
 import https from 'https';
 import type { ClientRequest, IncomingMessage } from 'http';
-import type { CreateChatCompletionRequest, CreateChatCompletionResponse } from 'openai';
+import type { ChatCompletionRequestMessage, CreateChatCompletionRequest, CreateChatCompletionResponse } from 'openai';
 import { type TiktokenModel } from '@dqbd/tiktoken';
 import createHttpsProxyAgent from 'https-proxy-agent';
 import { KnownError } from './error.js';
+import type { CommitType } from './config.js';
 
 const httpsPost = async (
 	hostname: string,
@@ -100,7 +101,46 @@ const sanitizeMessage = (message: string) => message.trim().replace(/[\n\r]/g, '
 
 const deduplicateMessages = (array: string[]) => Array.from(new Set(array));
 
-const getPrompt = (locale: string, diff: string) => `Write a git commit message in present tense for the following diff without prefacing it with anything. Do not be needlessly verbose and make sure the answer is concise and to the point. The response must be in the language ${locale}:\n${diff}`;
+const getBasePrompt = (locale: string) => `Write an insightful but concise Git commit message in a complete sentence in present tense for the diff that I provide you without prefacing it with anything, the response must be in the language ${locale}`;
+
+const getCommitMessageFormatPrompt = (type: CommitType) => {
+	if (type === 'conventional') {
+		return '<type>(<optional scope>): <commit message>';
+	}
+
+	return '<commit message>';
+};
+
+const getExtraContextForConventionalCommits = () => {
+	/**
+	 * References:
+	 * Commitlint:
+	 * https://github.com/conventional-changelog/commitlint/blob/18fbed7ea86ac0ec9d5449b4979b762ec4305a92/%40commitlint/config-conventional/index.js#L40-L100
+	 *
+	 * Conventional Changelog:
+	 * https://github.com/conventional-changelog/conventional-changelog/blob/d0e5d5926c8addba74bc962553dd8bcfba90e228/packages/conventional-changelog-conventionalcommits/writer-opts.js#L182-L193
+	 */
+	const conventionalCommitTypes: Record<string, string> = {
+		/*
+			Commented out because they are too common and
+			will cause the model to generate them too often.
+		*/
+		docs: 'Documentation only changes',
+		style:
+			'Changes that do not affect the meaning of the code (white-space, formatting, missing semi-colons, etc)',
+		refactor: 'A code change that neither fixes a bug nor adds a feature',
+		perf: 'A code change that improves performance',
+		test: 'Adding missing tests or correcting existing tests',
+		build: 'Changes that affect the build system or external dependencies',
+		ci: 'Changes to our CI configuration files and scripts',
+		chore: "Other changes that don't modify src or test files",
+		revert: 'Reverts a previous commit',
+		feat: 'A new feature',
+		fix: 'A bug fix',
+	};
+
+	return `Choose a type from the type-to-description JSON below that best describes the git diff:\n${JSON.stringify(conventionalCommitTypes, null, 2)}`;
+};
 
 export const generateCommitMessage = async (
 	apiKey: string,
@@ -108,31 +148,43 @@ export const generateCommitMessage = async (
 	locale: string,
 	diff: string,
 	completions: number,
+	type: CommitType,
 	timeout: number,
 	proxy?: string,
 ) => {
-	const prompt = getPrompt(locale, diff);
+	const basePrompt = getBasePrompt(locale);
+
+	const commitMessageFormatPrompt = getCommitMessageFormatPrompt(
+		type,
+	);
+
+	const conventionalCommitsExtraContext = type === 'conventional'
+		? getExtraContextForConventionalCommits()
+		: '';
+
+	const messages: ChatCompletionRequestMessage[] = [
+		{
+			role: 'system',
+			content: `${basePrompt}\n${commitMessageFormatPrompt}\n${conventionalCommitsExtraContext}`,
+		},
+		{
+			role: 'user',
+			content: diff,
+		},
+	];
 
 	try {
-		const completion = await createChatCompletion(
-			apiKey,
-			{
-				model,
-				messages: [{
-					role: 'user',
-					content: prompt,
-				}],
-				temperature: 0.7,
-				top_p: 1,
-				frequency_penalty: 0,
-				presence_penalty: 0,
-				max_tokens: 200,
-				stream: false,
-				n: completions,
-			},
-			timeout,
-			proxy,
-		);
+		const completion = await createChatCompletion(apiKey, {
+			model,
+			messages,
+			temperature: 0.7,
+			top_p: 1,
+			frequency_penalty: 0,
+			presence_penalty: 0,
+			max_tokens: 200,
+			stream: false,
+			n: completions,
+		}, timeout, proxy);
 
 		return deduplicateMessages(
 			completion.choices
